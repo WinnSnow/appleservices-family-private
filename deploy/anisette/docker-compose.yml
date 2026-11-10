@@ -1,0 +1,31 @@
+# Self-hosted anisette-v3 service.
+#
+# This is the endpoint the login flow expects: GET /v3/client_info,
+# POST /v3/get_headers, GET /v3/provisioning_session (WebSocket).
+# Verified against source/app.d of Dadoum/anisette-v3-server.
+#
+# The container holds the ADI library that computes X-Apple-I-MD. It never
+# talks to Apple on its own: the client performs Apple's provisioning
+# handshake and exchanges only crypto blobs with this service, so this host
+# can run with no Apple egress.
+services:
+  anisette-v3:
+    image: dadoum/anisette-v3-server:latest
+    container_name: anisette-v3
+    restart: unless-stopped
+    # Bind to loopback only. Publish it through the reverse proxy below, or
+    # keep it loopback and reach it over an SSH tunnel from the app host.
+    ports:
+      - "127.0.0.1:6969:6969"
+    volumes:
+      - anisette-v3-data:/home/Alcoholic/.config/anisette-v3/lib/
+    security_opt:
+      - no-new-privileges:true
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+volumes:
+  anisette-v3-data:

@@ -16,6 +16,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"slices"
 	"strings"
 	"sync"
@@ -910,7 +911,14 @@ func (s *Server) startInMode(ctx context.Context, dir string, creds credentials,
 		return control.Result{Message: "无法创建运行日志"}
 	}
 	defer diagnostic.Close()
-	command := exec.Command(s.config.Worker, "-native-adi", "-background", "-control-api", "-gui-auth", "-dir", dir, "-adi-dll", s.config.Library, "-python", s.config.Python)
+	// The native ADI module is a Windows-only OpenBubbles DLL. On any other
+	// platform the worker runs from the anisette provider instead, so the flag
+	// and the DLL path must not be forced.
+	workerArgs := []string{"-background", "-control-api", "-gui-auth", "-dir", dir}
+	if runtime.GOOS == "windows" {
+		workerArgs = append(workerArgs, "-native-adi", "-adi-dll", s.config.Library, "-python", s.config.Python)
+	}
+	command := exec.Command(s.config.Worker, workerArgs...)
 	command.Args = append(command.Args, "-twofactor", creds.TwoFactor)
 	if resume {
 		command.Args = append(command.Args, "-resume-session")

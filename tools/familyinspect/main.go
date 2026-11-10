@@ -27,6 +27,7 @@ import (
 	"time"
 
 	appleservices "github.com/Laky-64/appleservices"
+	"github.com/Laky-64/appleservices/anisette"
 	"github.com/Laky-64/appleservices/gsa"
 	"github.com/Laky-64/appleservices/icloud"
 	"github.com/Laky-64/appleservices/nativeadi"
@@ -490,31 +491,36 @@ func run() error {
 	if err != nil || json.Unmarshal(data, &device) != nil || len(device.Identifier) != 16 || device.SerialNumber == "" {
 		return errors.New("bound device unavailable")
 	}
-	var hardware struct {
-		Push struct {
-			Token []byte `plist:"token"`
-		} `plist:"push"`
-	}
+	// The bound Mac identity (native ADI + APS token) is preferred, but it is
+	// Windows-only. When it is unavailable, fall back to an anisette provider so
+	// the same protocol work can run on Linux or macOS servers.
 	profile := filepath.Join(*dir, "native-adi")
-	data, err = os.ReadFile(filepath.Join(profile, "hw_info.plist"))
-	if err != nil {
-		return errors.New("bound Mac hardware unavailable")
-	}
-	if _, err := plist.Unmarshal(data, &hardware); err != nil || len(hardware.Push.Token) != 32 {
-		return errors.New("bound APS token unavailable")
-	}
-	library, _ := filepath.Abs(".cache/openbubbles-store/rust_lib_bluebubbles.dll")
 	ctx, cancel := context.WithTimeout(context.Background(), 75*time.Second)
 	defer cancel()
-	native, err := nativeadi.NewClient(nativeadi.Config{LibraryPath: library, ProfileDir: profile, Python: "python", Identifier: device.Identifier, Serial: device.SerialNumber, PushToken: hardware.Push.Token})
-	if err != nil {
-		return err
+	var pushToken []byte
+	if data, readErr := os.ReadFile(filepath.Join(profile, "hw_info.plist")); readErr == nil {
+		var hardware struct {
+			Push struct {
+				Token []byte `plist:"token"`
+			} `plist:"push"`
+		}
+		if _, decodeErr := plist.Unmarshal(data, &hardware); decodeErr == nil && len(hardware.Push.Token) == 32 {
+			pushToken = hardware.Push.Token
+		}
 	}
-	if err := native.Start(ctx); err != nil {
-		return err
+	var headersProvider gsa.AnisetteProvider
+	library, _ := filepath.Abs(".cache/openbubbles-store/rust_lib_bluebubbles.dll")
+	if native, nativeErr := nativeadi.NewClient(nativeadi.Config{LibraryPath: library, ProfileDir: profile, Python: "python", Identifier: device.Identifier, Serial: device.SerialNumber, PushToken: pushToken}); nativeErr == nil {
+		if startErr := native.Start(ctx); startErr == nil {
+			defer native.Close()
+			headersProvider = native
+		}
 	}
-	defer native.Close()
-	headers, err := native.Headers()
+	if headersProvider == nil {
+		headersProvider = anisette.NewProvider()
+		fmt.Println("bound Mac identity unavailable; using the anisette provider pool")
+	}
+	headers, err := headersProvider.Headers()
 	if err != nil {
 		return err
 	}
@@ -613,7 +619,9 @@ func run() error {
 		request.Header.Set("Accept-Language", "en-US")
 		if fresno {
 			request.Header.Set("Content-Type", "application/x-plist")
-			request.Header.Set("X-APNS-Push-Token", strings.ToUpper(fmt.Sprintf("%x", hardware.Push.Token)))
+			if len(pushToken) == 32 {
+				request.Header.Set("X-APNS-Push-Token", strings.ToUpper(fmt.Sprintf("%x", pushToken)))
+			}
 		}
 		request.Header.Set("Authorization", "Basic "+tokenHeader(accepted.Session.DSID, accepted.Session.Tokens["mmeAuthToken"]))
 		// Apple's current macOS FamilyKit client binds Basic and both GS app
@@ -1196,7 +1204,7 @@ func run() error {
 			if rawPassword == "" {
 				return errors.New("target password environment is empty")
 			}
-			targetCredential, targetErr = ephemeralFamilyPET(ctx, native, hardware.Push.Token, *addPoolMemberDir, target, rawPassword)
+			targetCredential, targetErr = ephemeralFamilyPET(ctx, headersProvider, pushToken, *addPoolMemberDir, target, rawPassword)
 			rawPassword = ""
 			if targetErr != nil {
 				return targetErr
@@ -1780,12 +1788,12 @@ func localFamilyVerificationCode(targetDir string) (string, error) {
 	return code, nil
 }
 
-func ephemeralFamilyPET(ctx context.Context, native *nativeadi.Client, pushToken []byte, targetDir string, target appleservices.Session, password string) (string, error) {
+func ephemeralFamilyPET(ctx context.Context, provider gsa.AnisetteProvider, pushToken []byte, targetDir string, target appleservices.Session, password string) (string, error) {
 	cookies := map[string][]gsa.CookieKV{}
 	for _, cookie := range target.Cookies {
 		cookies[cookie.URL] = append(cookies[cookie.URL], gsa.CookieKV{Name: cookie.Name, Value: cookie.Value})
 	}
-	client := gsa.NewClientFromSession(native, gsa.Session{DSID: target.DSID, Cookies: cookies, Tokens: target.Tokens})
+	client := gsa.NewClientFromSession(provider, gsa.Session{DSID: target.DSID, Cookies: cookies, Tokens: target.Tokens})
 	client.EnableNativeDeviceAuthentication()
 	if err := client.SetPushToken(pushToken); err != nil {
 		return "", err

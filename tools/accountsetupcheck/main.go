@@ -140,7 +140,6 @@ func run() error {
 		}
 		fmt.Println("isolated native profile selected; original account state retained")
 	}
-	data, err = os.ReadFile(filepath.Join(profile, "hw_info.plist"))
 	var hardware struct {
 		OSConfig struct {
 			UDID string `plist:"udid"`
@@ -149,25 +148,39 @@ func run() error {
 			Token []byte `plist:"token"`
 		} `plist:"push"`
 	}
+	profileUnavailable := false
+	data, err = os.ReadFile(filepath.Join(profile, "hw_info.plist"))
 	if err != nil {
-		return fmt.Errorf("hardware unavailable")
-	}
-	if _, err := plist.Unmarshal(data, &hardware); err != nil || len(hardware.Push.Token) != 32 {
-		return fmt.Errorf("APS token unavailable")
+		profileUnavailable = true
+	} else if _, decodeErr := plist.Unmarshal(data, &hardware); decodeErr != nil || len(hardware.Push.Token) != 32 {
+		profileUnavailable = true
 	}
 	library, _ := filepath.Abs(".cache/openbubbles-store/rust_lib_bluebubbles.dll")
-	native, err := nativeadi.NewClient(nativeadi.Config{LibraryPath: library, ProfileDir: profile, Python: "python", Identifier: device.Identifier, Serial: device.SerialNumber, PushToken: hardware.Push.Token})
-	if err != nil {
-		return err
-	}
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
 	defer cancel()
-	if err := native.Start(ctx); err != nil {
-		return err
+	// The bound Mac identity is preferred but Windows-only. When it is absent,
+	// fall back to an anisette provider so this tool runs on a Linux server.
+	var localNative *nativeadi.Client
+	if !profileUnavailable {
+		if candidate, nativeErr := nativeadi.NewClient(nativeadi.Config{LibraryPath: library, ProfileDir: profile, Python: "python", Identifier: device.Identifier, Serial: device.SerialNumber, PushToken: hardware.Push.Token}); nativeErr == nil {
+			if startErr := candidate.Start(ctx); startErr == nil {
+				defer candidate.Close()
+				localNative = candidate
+			}
+		}
 	}
-	defer native.Close()
+	var headersProvider gsa.AnisetteProvider
+	if localNative != nil && strings.TrimSpace(os.Getenv("APPLESERVICES_REMOTE_ANISETTE")) != "1" {
+		headersProvider = localNative
+	} else {
+		headersProvider = anisette.NewProvider()
+		fmt.Println("bound Mac identity unavailable or bypassed; using the anisette provider pool")
+	}
+	if *nativeOnly && localNative == nil {
+		return fmt.Errorf("native-only mode requires a bound Windows Mac identity")
+	}
 	if *nativeOnly {
-		headers, err := native.Headers()
+		headers, err := localNative.Headers()
 		if err != nil {
 			return err
 		}
@@ -184,7 +197,7 @@ func run() error {
 		if err != nil || json.Unmarshal(data, &accepted) != nil || !strings.EqualFold(accepted.Session.AppleID, username) || accepted.ADSID != saved.DSID || accepted.Session.DSID == "" || accepted.Session.Tokens["mmeAuthToken"] == "" {
 			return fmt.Errorf("accepted iCloud checkpoint account binding failed")
 		}
-		headers, err := native.Headers()
+		headers, err := headersProvider.Headers()
 		if err != nil {
 			return err
 		}
@@ -198,11 +211,6 @@ func run() error {
 			return readStorageOffers(ctx, username, accepted.Session.DSID, accepted.ADSID, token, saved.Tokens["com.apple.gs.icloud.storage.buy"], headers)
 		}
 		return nil
-	}
-	var headersProvider gsa.AnisetteProvider = native
-	if strings.TrimSpace(os.Getenv("APPLESERVICES_REMOTE_ANISETTE")) == "1" {
-		headersProvider = anisette.NewProvider()
-		fmt.Println("remote anisette enabled; Apple requests remain direct (no HTTP/SOCKS proxy)")
 	}
 	cookies := map[string][]gsa.CookieKV{}
 	for _, cookie := range saved.Cookies {
@@ -246,7 +254,10 @@ func run() error {
 			return fmt.Errorf("2FA challenge has no identity binding")
 		}
 		if *localTrustedCode {
-			code, err := native.Code(ctx)
+			if localNative == nil {
+				return fmt.Errorf("local trusted code requires a bound Windows Mac identity; use -code-file with an SMS code instead")
+			}
+			code, err := localNative.Code(ctx)
 			if err != nil {
 				return fmt.Errorf("local trusted code unavailable")
 			}
@@ -551,7 +562,7 @@ func run() error {
 	// The pinned OpenBubbles updateAccountUi intercepts every AJAX request
 	// and attaches fresh anisette headers. They are required in addition to
 	// the headers set by Apple's page script itself.
-	updateHeaders, err := native.Headers()
+	updateHeaders, err := headersProvider.Headers()
 	if err != nil {
 		return err
 	}
